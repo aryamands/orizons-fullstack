@@ -5,6 +5,7 @@ const cors = require('cors');
 const session = require('express-session');
 const bcrypt = require('bcrypt');
 const dns = require('dns');
+const fs = require('fs');
 const path = require('path');
 
 const Subscriber = require('./models/Subscriber');
@@ -97,8 +98,50 @@ app.use('/admin', noStore);
 app.use('/client-portal', protectClientPortal);
 app.use('/client-portal', noStore);
 
-// Serve static frontend files
-app.use(express.static(path.join(__dirname, '../frontend')));
+const frontendDirCandidates = [
+    path.join(__dirname, '../frontend'),
+    path.join(__dirname, 'frontend'),
+    path.join(process.cwd(), 'frontend')
+];
+
+const frontendDir = frontendDirCandidates.find((candidate) =>
+    fs.existsSync(path.join(candidate, 'index.html'))
+);
+
+if (frontendDir) {
+    app.use(express.static(frontendDir));
+    console.log(`[INFO] Frontend static directory mapped: ${frontendDir}`);
+} else {
+    console.warn('[WARN] Frontend directory not found. Static page routes may return 404 unless FRONTEND_BASE_URL is configured.');
+}
+
+const frontendBaseUrl = (process.env.FRONTEND_BASE_URL || '').replace(/\/+$/, '');
+const frontendPageRoutes = [
+    '/',
+    '/index.html',
+    '/privacy.html',
+    '/about/about.html',
+    '/services/services.html',
+    '/solar/solar.html',
+    '/contact/contact.html',
+    '/blog/index.html'
+];
+
+app.get(frontendPageRoutes, (req, res, next) => {
+    if (frontendDir) {
+        const requestedPath = req.path === '/' ? 'index.html' : req.path.replace(/^\/+/, '');
+        const filePath = path.join(frontendDir, requestedPath);
+        if (fs.existsSync(filePath)) {
+            return res.sendFile(filePath);
+        }
+    }
+
+    if (frontendBaseUrl) {
+        return res.redirect(302, `${frontendBaseUrl}${req.path}`);
+    }
+
+    return next();
+});
 
 // ==========================================
 // 4. API: ADMIN LOGIN
