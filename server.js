@@ -1,11 +1,13 @@
-require('dotenv').config(); // This loads the variables
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const session = require('express-session');
-const MongoStore = require('connect-mongo');
 const bcrypt = require('bcrypt');
+const dns = require('dns');
 const path = require('path');
+
+const Subscriber = require('./models/Subscriber');
 
 const app = express();
 const PORT = 5000;
@@ -15,15 +17,29 @@ const PORT = 5000;
 // ==========================================
 app.use(express.json());
 app.use(cors({
-    origin: 'http://127.0.0.1:5500', 
+    origin: ['http://127.0.0.1:5500', 'http://localhost:5000'],
     credentials: true
 }));
 
-const mongoURI = 'mongodb+srv://admin:Admin%40123@cluster0.hr47sc6.mongodb.net/orizons_v3?appName=Cluster0';
+const mongoURI = process.env.MONGO_URI || 'mongodb+srv://admin:Admin%40123@cluster0.hr47sc6.mongodb.net/orizons_v3?appName=Cluster0';
+
+const preferredDnsServers = (process.env.MONGO_DNS_SERVERS || '8.8.8.8,1.1.1.1')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+if (preferredDnsServers.length > 0) {
+    try {
+        dns.setServers(preferredDnsServers);
+        console.log(`[INFO] DNS resolvers set for MongoDB SRV lookup: ${preferredDnsServers.join(', ')}`);
+    } catch (error) {
+        console.warn('[WARN] Failed to set custom DNS resolvers:', error.message);
+    }
+}
 
 mongoose.connect(mongoURI)
-    .then(() => console.log("✔ ORIZONS DATABASE CONNECTED"))
-    .catch(err => console.log("✘ DATABASE ERROR:", err.message));
+    .then(() => console.log('[OK] ORIZONS DATABASE CONNECTED'))
+    .catch(err => console.log('[ERROR] DATABASE ERROR:', err.message));
 
 // ==========================================
 // 1.5 MONGOOSE DATA MODELS
@@ -31,41 +47,41 @@ mongoose.connect(mongoURI)
 const inquirySchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true },
-    type: String, 
+    type: String,
     budget: String,
     notes: String,
     submittedAt: { type: Date, default: Date.now }
 });
+
 const Inquiry = mongoose.model('Inquiry', inquirySchema, 'clientdatas');
-// AND add this check route right below it
+
 app.get('/api/check-db', async (req, res) => {
     const allLeads = await Inquiry.find({});
     res.json(allLeads);
 });
-const subscriberSchema = new mongoose.Schema({
-    email: { type: String, required: true, unique: true },
-    subscribedAt: { type: Date, default: Date.now }
-});
-const Subscriber = mongoose.model('Subscriber', subscriberSchema);
 
 // ==========================================
 // 2. SESSION ENGINE
 // ==========================================
 app.use(session({
-    secret: 'arch_secret_orizons_2026',
+    name: 'orizons.sid',
+    secret: process.env.SESSION_SECRET || 'arch_secret_orizons_2026',
     resave: false,
     saveUninitialized: false,
-    store: MongoStore.create({ 
-        mongoUrl: mongoURI,
-        collectionName: 'sessions' 
-    }),
+    unset: 'destroy',
     cookie: {
-        maxAge: 1000 * 60 * 60 * 2, // 2 Hours
-        secure: false, // Set to true when deploying to HTTPS
+        secure: process.env.NODE_ENV === 'production',
         httpOnly: true,
         sameSite: 'lax'
     }
 }));
+
+const noStore = (req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+};
 
 // ==========================================
 // 3. SECURITY GATEKEEPER
@@ -74,11 +90,12 @@ const protectClientPortal = (req, res, next) => {
     if (req.session && req.session.isAuthenticated) {
         return next();
     }
-    res.redirect('/admin/admin.html');
+    return res.redirect('/admin/admin.html');
 };
 
-// Protect the client portal route
+app.use('/admin', noStore);
 app.use('/client-portal', protectClientPortal);
+app.use('/client-portal', noStore);
 
 // Serve static frontend files
 app.use(express.static(path.join(__dirname, '../frontend')));
@@ -88,89 +105,105 @@ app.use(express.static(path.join(__dirname, '../frontend')));
 // ==========================================
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
-    const storedUsername = "Orizons";
-    const storedHash = "$2b$10$qYTkmTzn3cIndtFogJ7RiOO3tToULUns2XMvIQ0c2R3n/UFBLsTsu"; 
+    const storedUsername = 'Orizons';
+    const storedHash = '$2b$10$qYTkmTzn3cIndtFogJ7RiOO3tToULUns2XMvIQ0c2R3n/UFBLsTsu';
 
     try {
         if (username === storedUsername) {
             const isMatch = await bcrypt.compare(password, storedHash);
             if (isMatch) {
-                req.session.isAuthenticated = true;
-                return req.session.save(() => {
-                    res.json({ success: true });
+                return req.session.regenerate((regenerateErr) => {
+                    if (regenerateErr) {
+                        return res.status(500).json({ success: false, error: 'SESSION_INIT_FAILED' });
+                    }
+
+                    req.session.isAuthenticated = true;
+                    return req.session.save(() => {
+                        res.json({ success: true });
+                    });
                 });
             }
         }
-        res.status(401).json({ success: false, error: "AUTH_FAILED" });
+
+        return res.status(401).json({ success: false, error: 'AUTH_FAILED' });
     } catch (err) {
-        res.status(500).json({ error: "SERVER_ERROR" });
+        return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
     }
 });
 
 // ==========================================
-// 4.5 API: SECURE LOGOUT (THE NEW ADDITION)
+// 4.5 API: SECURE LOGOUT
 // ==========================================
 app.post('/api/admin/logout', (req, res) => {
-    // 1. Physically destroy the session in MongoDB
-    req.session.destroy((err) => {
+    if (!req.session) {
+        res.clearCookie('orizons.sid', { path: '/' });
+        return res.json({ success: true, message: 'VAULT_LOCKED' });
+    }
+
+    return req.session.destroy((err) => {
         if (err) {
-            console.error("✘ Logout Error:", err);
-            return res.status(500).json({ success: false, message: "LOGOUT_FAILED" });
+            console.error('[ERROR] Logout Error:', err);
+            return res.status(500).json({ success: false, message: 'LOGOUT_FAILED' });
         }
-        
-        // 2. Clear the cookie from the user's browser
-        res.clearCookie('connect.sid', { path: '/' }); 
-        
-        console.log("✔ Vault Locked. Session Destroyed.");
-        res.json({ success: true, message: "VAULT_LOCKED" });
+
+        res.clearCookie('orizons.sid', { path: '/' });
+        console.log('[OK] Vault Locked. Session Destroyed.');
+        return res.json({ success: true, message: 'VAULT_LOCKED' });
     });
 });
 
 // ==========================================
-// 4.6 FRONTEND AUTH CHECKER (For Live Server Testing)
+// 4.6 FRONTEND AUTH CHECKER
 // ==========================================
-app.get('/api/check-auth', (req, res) => {
+app.get('/api/check-auth', noStore, (req, res) => {
     if (req.session && req.session.isAuthenticated) {
-        res.status(200).json({ authenticated: true });
-    } else {
-        res.status(401).json({ authenticated: false });
+        return res.status(200).json({ authenticated: true });
     }
+    return res.status(401).json({ authenticated: false });
 });
 
 // ==========================================
 // 5. DATA INTAKE PIPELINES (SAVING TO ATLAS)
 // ==========================================
-// A. INQUIRY PIPELINE (WITH X-RAY LOGGING)
+
+// A. INQUIRY PIPELINE
 app.post('/api/contact', async (req, res) => {
-    console.log("\n=================================");
-    console.log("🚨 INCOMING REQUEST TO /api/contact");
-    console.log("📦 RAW DATA RECEIVED:", req.body);
-    console.log("=================================\n");
+    console.log('\n=================================');
+    console.log('[ALERT] INCOMING REQUEST TO /api/contact');
+    console.log('[DATA] RAW DATA RECEIVED:', req.body);
+    console.log('=================================\n');
 
     try {
         const newInquiry = new Inquiry(req.body);
         await newInquiry.save();
-        
-        console.log("✔ SUCCESS: Lead Saved to Atlas ->", req.body.name);
-        res.json({ success: true, message: "INQUIRY_SECURED" });
+
+        console.log('[OK] SUCCESS: Lead Saved to Atlas ->', req.body.name);
+        return res.json({ success: true, message: 'INQUIRY_SECURED' });
     } catch (err) {
-        console.error("✘ MONGOOSE REJECTED THE DATA!");
-        console.error("Exact Error:", err.message);
-        res.status(500).json({ success: false, error: "DATABASE_WRITE_ERROR", details: err.message });
+        console.error('[ERROR] MONGOOSE REJECTED THE DATA!');
+        console.error('Exact Error:', err.message);
+        return res.status(500).json({ success: false, error: 'DATABASE_WRITE_ERROR', details: err.message });
     }
 });
 
+// B. NEWSLETTER PIPELINE
 app.post('/api/subscribe', async (req, res) => {
     try {
-        const newSubscriber = new Subscriber({ email: req.body.email });
-        await newSubscriber.save();
-        console.log("✔ New Subscriber Added:", req.body.email);
-        res.json({ success: true, message: "SUBSCRIBED" });
-    } catch (err) {
-        if (err.code === 11000) {
-            return res.status(400).json({ success: false, error: "DUPLICATE_EMAIL" });
+        const { email } = req.body;
+
+        const existingSubscriber = await Subscriber.findOne({ email });
+        if (existingSubscriber) {
+            return res.status(400).json({ message: 'Email is already subscribed.' });
         }
-        res.status(500).json({ success: false, error: "SERVER_ERROR" });
+
+        const newSubscriber = new Subscriber({ email });
+        await newSubscriber.save();
+
+        console.log('[OK] New Subscriber Added:', email);
+        return res.status(201).json({ message: 'Successfully subscribed!' });
+    } catch (error) {
+        console.error('Newsletter Subscription Error:', error);
+        return res.status(500).json({ message: 'Server error. Please try again later.' });
     }
 });
 
@@ -178,5 +211,5 @@ app.post('/api/subscribe', async (req, res) => {
 // 6. SERVER LAUNCH
 // ==========================================
 app.listen(PORT, () => {
-    console.log(`🚀 ORIZONS SECURE ENGINE ACTIVE: http://localhost:${PORT}`);
+    console.log(`[STARTED] ORIZONS SECURE ENGINE ACTIVE: http://localhost:${PORT}`);
 });
